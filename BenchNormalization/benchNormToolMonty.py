@@ -1,57 +1,93 @@
-import subprocess
 import multiprocessing
 import os
 import sys
 import time
+import subprocess
 
-IS_WINDOWS = os.name == 'nt'
+IS_WINDOWS = os.name == "nt"
 
-def run_single_bench_monty(engine, queue):
-    bench_sig = None
-    bench_nps = None
-
+def worker(engine, queue):
+    """
+    Start Monty once, then repeatedly send 'bench' and read its result.
+    Each time a 'Bench:' line is seen, push (sig, nps) into queue.
+    """
     p = subprocess.Popen(
-        [engine, "bench"],
-        stderr=subprocess.DEVNULL,
+        [engine],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        universal_newlines=True,
+        stderr=subprocess.DEVNULL,
+        text=True,
         bufsize=1,
         close_fds=not IS_WINDOWS,
     )
 
-    for line in iter(p.stdout.readline, ""):
-        if "Bench: " in line:
-            spl = line.split(' ')
-            bench_sig = int(spl[1].strip())
-            bench_nps = float(spl[3].strip())
+    assert p.stdin and p.stdout
 
-    queue.put((bench_sig, bench_nps))
+    try:
+        while True:
+            # send a bench command
+            p.stdin.write("bench\n")
+            p.stdin.flush()
 
-def verify_signature(engine, active_cores):
+            sig, nps = None, None
+            for line in iter(p.stdout.readline, ""):
+                if "Bench:" in line and "nps" in line.lower():
+                    parts = line.strip().split()
+                    # e.g. Bench: 1119942 nodes 584628 nps
+                    if len(parts) >= 5:
+                        sig = int(parts[1])
+                        nps = float(parts[3])
+                    break  # stop after one bench result
+
+            if sig is not None and nps is not None:
+                queue.put((sig, nps))
+            else:
+                # engine misbehaved? bail
+                queue.put((None, None))
+                break
+    finally:
+        with subprocess.Popen:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
+def verify_signature(engine, active_cores, duration=60):
     queue = multiprocessing.Queue()
 
-    processes = [
-        multiprocessing.Process(
-            target=run_single_bench_monty,
-            args=(engine, queue),
-        ) for _ in range(active_cores)
+    workers = [
+        multiprocessing.Process(target=worker, args=(engine, queue))
+        for _ in range(active_cores)
     ]
 
-    for p in processes:
-        p.start()
+    for w in workers:
+        w.start()
 
-    results = [queue.get() for _ in range(active_cores)]
-    bench_nps = 0.0
+    start = time.time()
+    results = []
 
-    for sig, nps in results:
-        bench_nps += nps
+    while time.time() - start < duration:
+        try:
+            sig, nps = queue.get(timeout=5)
+            if nps is not None:
+                results.append(nps)
+        except Exception:
+            pass
 
-    bench_nps /= active_cores
+    # cleanup
+    for w in workers:
+        if w.is_alive():
+            w.terminate()
+        w.join()
 
-    return bench_nps
+    if not results:
+        raise RuntimeError("No benchmark results parsed from engine output.")
+
+    return sum(results) / len(results)
+
 
 def main():
-    print("Running benchmark. This will take a minute")
     if len(sys.argv) != 3:
         print("Usage: python script.py <engine_path> <active_cores>")
         sys.exit(1)
@@ -59,17 +95,11 @@ def main():
     engine_path = sys.argv[1]
     active_cores = int(sys.argv[2])
 
-    start_time = time.time()
-    total_nps = 0.0
-    count = 0
+    print(f"Running benchmark for 60s with {active_cores} Monty workers...")
 
-    while time.time() - start_time < 60:  # 5 minutes = 300 seconds
-        bench_nps = verify_signature(engine_path, active_cores)
-        total_nps += bench_nps
-        count += 1
+    avg_nps = verify_signature(engine_path, active_cores, duration=60)
+    print(f"Final Average Benchmark NPS: {avg_nps:.2f}")
 
-    average_nps = total_nps / count
-    print(f"Final Average Benchmark NPS over a minute: {average_nps}")
 
 if __name__ == "__main__":
     main()
